@@ -43,6 +43,7 @@ class DataParallelPPOCritic(BasePPOCritic):
         self.critic_module = critic_module
         self.critic_optimizer = critic_optimizer
 
+    @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     def _forward_micro_batch(self, micro_batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         input_ids = micro_batch["input_ids"]
         attention_mask = micro_batch["attention_mask"]

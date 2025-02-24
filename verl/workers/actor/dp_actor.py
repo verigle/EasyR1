@@ -52,13 +52,14 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer = actor_optimizer
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
 
+    @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     def _forward_micro_batch(
         self, micro_batch: Dict[str, torch.Tensor], temperature: float
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Returns:
-            entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
+            entropy: # (bs, response_len)
         """
         input_ids = micro_batch["input_ids"]
         attention_mask = micro_batch["attention_mask"]
@@ -88,9 +89,12 @@ class DataParallelPPOActor(BasePPOActor):
             logits.div_(temperature)
             logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
             log_probs = logprobs_from_logits(logits, responses)  # (bsz, response_length)
-            entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+            if self.config.entropy_coeff > 1e-6:
+                entropy = self.compute_entropy_from_logits(logits)  # (bsz, response_length)
+            else:
+                entropy = None
 
-        return entropy, log_probs
+        return log_probs, entropy
 
     def _optimizer_step(self) -> torch.Tensor:
         if isinstance(self.actor_module, FSDP):
@@ -136,7 +140,7 @@ class DataParallelPPOActor(BasePPOActor):
         for micro_batch in tqdm(micro_batches, desc="Compute log probs", disable=(self.rank != 0)):
             micro_batch.to("cuda")
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-            _, log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
+            log_probs, _ = self._forward_micro_batch(model_inputs, temperature=temperature)
             log_probs_lst.append(log_probs)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
@@ -179,24 +183,24 @@ class DataParallelPPOActor(BasePPOActor):
                 old_log_prob = model_inputs["old_log_probs"]
                 advantages = model_inputs["advantages"]
 
-                clip_ratio = self.config.clip_ratio
-                entropy_coeff = self.config.entropy_coeff
-
                 # all return: (bsz, response_length)
-                entropy, log_prob = self._forward_micro_batch(model_inputs, temperature=temperature)
+                log_prob, entropy = self._forward_micro_batch(model_inputs, temperature=temperature)
 
                 pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(
                     old_log_prob=old_log_prob,
                     log_prob=log_prob,
                     advantages=advantages,
                     eos_mask=response_mask,
-                    cliprange=clip_ratio,
+                    cliprange=self.config.clip_ratio,
                 )
                 # compute entropy loss from entropy
-                entropy_loss = verl_F.masked_mean(entropy, response_mask)
+                if self.config.entropy_coeff > 1e-6:
+                    entropy_loss = verl_F.masked_mean(entropy, response_mask)
+                else:
+                    entropy_loss = torch.tensor(0.0)
 
                 # compute policy loss
-                policy_loss = pg_loss - entropy_loss * entropy_coeff
+                policy_loss = pg_loss - entropy_loss * self.config.entropy_coeff
 
                 if self.config.use_kl_loss:
                     ref_log_prob = model_inputs["ref_log_prob"]
@@ -215,10 +219,10 @@ class DataParallelPPOActor(BasePPOActor):
                 loss.backward()
 
                 batch_metrics = {
-                    "actor/entropy_loss": entropy_loss.detach().item(),
                     "actor/pg_loss": pg_loss.detach().item(),
                     "actor/pg_clipfrac": pg_clipfrac.detach().item(),
                     "actor/ppo_kl": ppo_kl.detach().item(),
+                    "actor/entropy_loss": entropy_loss.detach().item(),
                 }
                 append_to_dict(metrics, batch_metrics)
 

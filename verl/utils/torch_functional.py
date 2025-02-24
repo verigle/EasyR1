@@ -34,15 +34,15 @@ except ImportError:
     FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = False
 
 
-def logprobs_from_logits(logits, labels):
+def logprobs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """
     See: https://github.com/pytorch/pytorch/issues/563#issuecomment-330103591
     """
     if FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE:
         batch_dim = logits.shape[:-1]
-        last_dim = logits.shape[-1]
-        logits = logits.reshape(-1, last_dim)
-        labels = labels.reshape(-1)
+        vocab_size = logits.shape[-1]
+        logits = logits.contiguous().view(-1, vocab_size)
+        labels = labels.contiguous().view(-1)
         output = logprobs_from_logits_flash_attn(logits, labels)
         output = output.view(*batch_dim)
     else:
@@ -91,7 +91,7 @@ def clip_by_value(x, tensor_min, tensor_max):
 
 def entropy_from_logits(logits: torch.Tensor):
     """Calculate entropy from logits."""
-    pd = torch.nn.functional.softmax(logits, dim=-1)
+    pd = F.softmax(logits.float(), dim=-1)  # should compute in fp32
     entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
     return entropy
 
